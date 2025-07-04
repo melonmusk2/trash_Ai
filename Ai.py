@@ -1,128 +1,190 @@
+import cv2
+import datetime
+import os
+import numpy as np 
 from urllib.request import urlopen
 from PIL import Image
 import timm
 import torch
+import subprocess
+import time
+from Data import train
+from rembg import remove
+from PIL import Image
+import io
 
-# Load image from URL
-try:
-    img = Image.open(urlopen('https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcT_p_4ET0w23YzM-cHhuIDdVYDzU1CXavkwgQ&s'))
-except Exception as e:
-    print(f"Error opening image from URL: {e}")
+
+# --- Configuration ---
+WEBCAM_INDEX = 0  # Usually 0 for the default webcam
+OUTPUT_DIR = 'motion_detected_images' # Directory to save images
+MIN_AREA = 50000  # Minimum contour area to be considered a significant object (adjust this value!)
+                  # Smaller values detect smaller movements, larger values ignore small noise.
+                  # needs to be adjusted according to env and webcam noise behavoir
+CAPTURE_COOLDOWN_SECONDS = 3 # Time in seconds before another picture can be taken AFTER a capture    
+MOTION_DURATION_REQUIRED = 2              
+GAUSSIAN_BLUR_SIZE = (21, 21) # Blur applied to frames to reduce noise
+THRESHOLD_DELTA = 25 # Pixel intensity difference threshold for motion detection
+
+# Create the output directory if it doesn't exist
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+# Open the webcam
+cap = cv2.VideoCapture(WEBCAM_INDEX)
+
+if not cap.isOpened():
+    print(f"Error: Could not open webcam with index {WEBCAM_INDEX}")
     exit()
 
-# Load pre-trained model
-model = timm.create_model('mobilenetv3_small_100.lamb_in1k', pretrained=True)
-model.eval()
+ # Expanded category mapping
 
-# ImageNet transform setup
-data_config = timm.data.resolve_model_data_config(model)
-transforms = timm.data.create_transform(**data_config, is_training=False)
+print("Webcam opened successfully. Press 'q' to quit.")
+print(f"Waiting to establish background. Please keep the scene clear for a few seconds...")
 
-# Model inference
-output = model(transforms(img).unsqueeze(0))
-probabilities = torch.nn.functional.softmax(output, dim=1) * 100
-top_prob, top_class_index = torch.max(probabilities, dim=1)
+# Initialize background frame
+avg_background_frame = None # This will store the accumulated background as float
+background_ready = False    # Flag to indicate if background is established
+frame_count = 0
+BACKGROUND_ESTIMATION_FRAMES = 10
 
-# Load ImageNet labels
-try:
-    with urlopen('https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt') as f:
-        labels = [line.strip().decode("utf-8") for line in f.readlines()]
-except Exception as e:
-    print(f"Could not load ImageNet labels. Error: {e}")
-    labels = None
+last_capture_time = None
+motion_start_time = None # Tracks when sustained motion began
+category = None
+return_code = 1
 
-# Expanded category mapping
-category_mapping = {
-    # PLASTIK
-    "water bottle": "plastik",
-    "plastic bag": "plastik",
-    "pop bottle": "plastik",
-    "packet": "plastik",
-    "sunscreen": "plastik",
-    "shampoo": "plastik",
-    "soap dispenser": "plastik",
-    "detergent": "plastik",
-    "toothbrush": "plastik",
-    "fork": "plastik",
-    "knife": "plastik",
-    "spoon": "plastik",
-    "container ship": "plastik",
-    "shopping basket": "plastik",
-    "tray": "plastik",
-    "lotion": "plastik",
-    "pen": "plastik",
-    "highlighter": "plastik",
-    "comb": "plastik",
-    "screwdriver": "plastik",
-    "toys": "plastik",
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Failed to grab frame")
+        break
 
-    # PAPER
-    "newspaper": "paper",
-    "notebook": "paper",
-    "book": "paper",
-    "envelope": "paper",
-    "magazine": "paper",
-    "toilet tissue": "paper",
-    "paper towel": "paper",
-    "calendar": "paper",
-    "folder": "paper",
-    "menu": "paper",
-    "paper plate": "paper",
-    "receipt": "paper",
-    "manual": "paper",
-    "document": "paper",
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, GAUSSIAN_BLUR_SIZE, 0)
+    current_time = datetime.datetime.now() # Get current time for all time-based checks
 
-    # ORGANIC
-    "banana": "organic",
-    "apple": "organic",
-    "orange": "organic",
-    "lemon": "organic",
-    "cucumber": "organic",
-    "corn": "organic",
-    "mushroom": "organic",
-    "carrot": "organic",
-    "broccoli": "organic",
-    "pineapple": "organic",
-    "eggplant": "organic",
-    "zucchini": "organic",
-    "lettuce": "organic",
-    "sandwich": "organic",
-    "pizza": "organic",
-    "hamburger": "organic",
-    "hotdog": "organic",
-    "bone": "organic",
-    "egg": "organic",
-    "bread": "organic",
-    "cake": "organic",
-    "cheeseburger": "organic",
-    "meat loaf": "organic",
-    "steak": "organic",
+    # --- Background Establishment Phase ---
+    if not background_ready:
+        if avg_background_frame is None:
+            avg_background_frame = gray.astype("float")
+        else:
+            cv2.accumulateWeighted(gray, avg_background_frame, 0.5)
 
-    # GLASS
-    "wine bottle": "glass",
-    "beer bottle": "glass",
-    "goblet": "glass",
-    "glass": "glass",
-    "vase": "glass",
-    "perfume": "glass",
+        frame_count += 1
 
-    # BATTERIES
-    "remote control": "batteries",
-    "cellular telephone": "batteries",
-    "iPod": "batteries",
-    "battery": "batteries",
-    "digital watch": "batteries",
-    "hand-held computer": "batteries",
-    "laptop": "batteries",
-}
+        if frame_count >= BACKGROUND_ESTIMATION_FRAMES:
+            background_ready = True
+            print("Background established. Starting motion detection...")
+            avg_background_frame_uint8 = cv2.convertScaleAbs(avg_background_frame)
+        
 
-# Display result
-if labels:
-    class_index = top_class_index.item()
-    probability = top_prob.item()
-    class_label = labels[class_index]
-    category = category_mapping.get(class_label, "anything else")
-    print(f"Top Prediction: {class_label} ({probability:.2f}%) -> Category: {category}")
-else:
-    print("Could not display human-readable label.")
-    print(f"Top class index: {top_class_index.item()} | Probability: {top_prob.item():.2f}%")
+        continue # Skip the motion detection logic until background is ready
+
+    # --- Motion Detection Phase ---
+    frame_delta = cv2.absdiff(avg_background_frame_uint8, gray)
+    thresh = cv2.threshold(frame_delta, THRESHOLD_DELTA, 255, cv2.THRESH_BINARY)[1]
+    thresh = cv2.dilate(thresh, None, iterations=2)
+    contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    object_detected_in_current_frame = False
+    for contour in contours:
+        if cv2.contourArea(contour) < MIN_AREA:
+            continue
+
+        object_detected_in_current_frame = True
+        (x, y, w, h) = cv2.boundingRect(contour)
+
+    # --- Sustained Motion Logic ---
+    if object_detected_in_current_frame:
+        if motion_start_time is None:
+            # Motion just started
+            motion_start_time = current_time
+        # else: motion is continuing, motion_start_time is already set
+    else:
+        # No motion detected in this frame, reset motion_start_time
+        motion_start_time = None
+
+    # --- Image Capture Logic ---
+    capture_condition_met = False
+    num_motion_files = len([name for name in os.listdir(OUTPUT_DIR) if os.path.isfile(os.path.join(OUTPUT_DIR, name))])
+
+    if motion_start_time is not None: # Motion is currently ongoing
+        time_since_motion_start = (current_time - motion_start_time).total_seconds()
+        if time_since_motion_start >= MOTION_DURATION_REQUIRED:
+            # Motion has been sustained for long enough
+            if last_capture_time is None or \
+               (current_time - last_capture_time).total_seconds() > CAPTURE_COOLDOWN_SECONDS:
+                capture_condition_met = True
+                if num_motion_files < 1: # This means 0 files
+                  capture_condition_met = True
+
+    if capture_condition_met and num_motion_files == 0 and return_code is not None:
+        filename = os.path.join(OUTPUT_DIR, f"object_motion.png")
+        print("Motion detected!")
+        cv2.imwrite(filename, frame)
+        last_capture_time = current_time
+        # Important: Reset motion_start_time AFTER capturing
+        # This prevents taking multiple pictures within the same sustained motion event
+        # until the cooldown or new motion starts.
+        motion_start_time = None 
+
+    if num_motion_files > 0:
+        try:
+          input_path = "motion_detected_images/object_motion.png"
+          output_path = "motion_detected_images/object_motion.png"
+          output_path2 = "obj.png"
+
+          with open(input_path, "rb") as f:
+            input_image = f.read()
+
+          img1 = remove(input_image)
+
+          
+          with open(output_path, "wb") as out:
+           out.write(img1)
+          
+          img = Image.open('motion_detected_images/object_motion.png').convert("RGB")
+        except Exception as e:
+            print(f"An error occurred while loading the image: {e}")
+            exit()
+
+        label = train(img)
+        # Display result
+        print(label)
+        if label:
+            category = label
+            os.remove("motion_detected_images/object_motion.png")
+        else:
+            print("Could not display human-readable label.")
+            os.remove("motion_detected_images/object_motion.png")
+    if category is not None:
+     arg = {
+      "battery": "5",
+      "biological": "1",
+      "brown-glass": "5",
+      "cardboard": "3",
+      "clothes": "2",
+      "green-glass": "5",
+      "metal": "2",
+      "paper": "3",
+      "plastic": "4",
+      "trash": "2",
+      "white_glass": "5"
+     }
+
+     #ARG = arg.get(category)
+     category = None
+
+     ARG = "3"
+
+     subprocess.run([
+      "ssh",
+      "robot@ev3dev",
+      "brickrun",
+      "--directory=/home/robot/motor_control_to_sort_trash",
+      "/home/robot/motor_control_to_sort_trash/main.py",
+      ARG
+     ])
+
+
+     
+
