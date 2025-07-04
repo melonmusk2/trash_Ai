@@ -171,10 +171,8 @@ while True:
       "white_glass": "5"
      }
 
-     #ARG = arg.get(category)
+     ARG = arg.get(category)
      category = None
-
-     ARG = "3"
 
      subprocess.run([
       "ssh",
